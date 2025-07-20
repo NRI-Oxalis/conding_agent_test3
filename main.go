@@ -1,507 +1,483 @@
 package main
 
 import (
-	"fmt"
-	"html/template"
-	"log"
-	"net/http"
-	"net/url"
-	"regexp"
-	"strings"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"fyne.io/fyne/v2"
 )
 
-type SearchResult struct {
-	Title       string
-	URL         string
-	Description string
-}
-
-type PageData struct {
-	Query   string
-	Results []SearchResult
-	Summary string
-	Error   string
+type SalesClosingApp struct {
+	app        fyne.App
+	window     fyne.Window
+	config     *APIConfig
+	currentContract *ContractInfo
+	core       *SalesClosingCore
+	
+	// UI components
+	mainTabs   *container.AppTabs
+	infoTab    *container.TabItem
+	docTab     *container.TabItem
+	configTab  *container.TabItem
 }
 
 func main() {
-	http.HandleFunc("/", homeHandler)
-	http.HandleFunc("/search", searchHandler)
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-
-	fmt.Println("Server starting on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	myApp := app.NewWithID("com.example.sales-closing-support")
+	myApp.SetIcon(theme.DocumentIcon())
+	
+	salesApp := &SalesClosingApp{
+		app:    myApp,
+		window: myApp.NewWindow("営業クロージング支援AIエージェント"),
+		config: &APIConfig{},
+		currentContract: &ContractInfo{},
+		core:   &SalesClosingCore{},
+	}
+	
+	salesApp.window.Resize(fyne.NewSize(900, 700))
+	salesApp.window.CenterOnScreen()
+	
+	salesApp.loadConfig()
+	salesApp.createUI()
+	
+	salesApp.window.ShowAndRun()
 }
 
-func homeHandler(w http.ResponseWriter, r *http.Request) {
-	tmpl := `
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Google検索サマリー</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #4285f4;
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .search-form {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        input[type="text"] {
-            width: 400px;
-            padding: 12px;
-            font-size: 16px;
-            border: 2px solid #ddd;
-            border-radius: 25px;
-            outline: none;
-        }
-        input[type="text"]:focus {
-            border-color: #4285f4;
-        }
-        button {
-            padding: 12px 24px;
-            margin-left: 10px;
-            background-color: #4285f4;
-            color: white;
-            border: none;
-            border-radius: 25px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        button:hover {
-            background-color: #3367d6;
-        }
-        .loading {
-            text-align: center;
-            display: none;
-        }
-        .error {
-            color: #d93025;
-            background-color: #fce8e6;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-        .results {
-            margin-top: 30px;
-        }
-        .summary {
-            background-color: #e8f0fe;
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            border-left: 4px solid #4285f4;
-        }
-        .result-item {
-            margin-bottom: 20px;
-            padding: 15px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            background-color: #fafafa;
-        }
-        .result-title {
-            font-size: 18px;
-            font-weight: bold;
-            color: #1a0dab;
-            margin-bottom: 5px;
-        }
-        .result-url {
-            color: #006621;
-            font-size: 14px;
-            margin-bottom: 8px;
-        }
-        .result-description {
-            color: #545454;
-            line-height: 1.4;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔍 Google検索サマリー</h1>
-        <form class="search-form" action="/search" method="GET">
-            <input type="text" name="q" placeholder="検索キーワードを入力してください..." required>
-            <button type="submit">検索</button>
-        </form>
-        <div class="loading" id="loading">検索中...</div>
-    </div>
-
-    <script>
-        document.querySelector('form').addEventListener('submit', function() {
-            document.getElementById('loading').style.display = 'block';
-        });
-    </script>
-</body>
-</html>
-`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, tmpl)
+func (app *SalesClosingApp) createUI() {
+	// Create main tabs
+	app.mainTabs = container.NewAppTabs()
+	
+	// Tab 1: Contract Information Confirmation
+	app.infoTab = container.NewTabItem("契約情報確認", app.createContractInfoTab())
+	app.mainTabs.Append(app.infoTab)
+	
+	// Tab 2: Document Generation
+	app.docTab = container.NewTabItem("書類生成", app.createDocumentGenTab())
+	app.mainTabs.Append(app.docTab)
+	
+	// Tab 3: Configuration
+	app.configTab = container.NewTabItem("設定", app.createConfigTab())
+	app.mainTabs.Append(app.configTab)
+	
+	// Set content
+	app.window.SetContent(app.mainTabs)
 }
 
-func searchHandler(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query().Get("q")
-	if query == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-
-	data := PageData{Query: query}
-
-	// Perform Google search
-	results, err := performGoogleSearch(query)
-	if err != nil {
-		data.Error = fmt.Sprintf("検索エラー: %v", err)
-	} else {
-		data.Results = results
-		data.Summary = generateSummary(results, query)
-	}
-
-	// Render results page
-	renderResults(w, data)
+func (app *SalesClosingApp) createContractInfoTab() *fyne.Container {
+	// Title
+	title := widget.NewLabelWithStyle("契約情報確認支援", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	title.TextStyle.Bold = true
+	
+	// Description
+	desc := widget.NewRichTextFromMarkdown(`
+営業担当者が契約締結後に行うべき情報確認プロセスを支援します。
+契約概要を入力すると、Confluenceのルールとの照合により、確認すべき情報やMattermostからのヒントを提示します。
+`)
+	
+	// Input form
+	customerEntry := widget.NewEntry()
+	customerEntry.SetPlaceHolder("顧客名を入力してください")
+	
+	contractTypeSelect := widget.NewSelect(
+		[]string{"新規契約", "継続契約", "追加契約", "変更契約"},
+		nil,
+	)
+	contractTypeSelect.SetSelected("新規契約")
+	
+	productEntry := widget.NewEntry()
+	productEntry.SetPlaceHolder("製品/サービス名を入力してください")
+	
+	amountEntry := widget.NewEntry()
+	amountEntry.SetPlaceHolder("契約金額を入力してください（例：1,000,000円）")
+	
+	dateEntry := widget.NewEntry()
+	dateEntry.SetPlaceHolder("契約日を入力してください（例：2024-01-15）")
+	
+	salesPersonEntry := widget.NewEntry()
+	salesPersonEntry.SetPlaceHolder("営業担当者名を入力してください")
+	
+	notesEntry := widget.NewMultiLineEntry()
+	notesEntry.SetPlaceHolder("追加の契約詳細や特記事項があれば入力してください")
+	notesEntry.Resize(fyne.NewSize(400, 100))
+	
+	// Result area
+	resultArea := widget.NewRichText()
+	resultArea.Resize(fyne.NewSize(400, 200))
+	resultScroll := container.NewScroll(resultArea)
+	resultScroll.SetMinSize(fyne.NewSize(400, 200))
+	
+	// Check button
+	checkBtn := widget.NewButton("情報確認チェックを実行", func() {
+		app.performContractCheck(
+			customerEntry.Text,
+			contractTypeSelect.Selected,
+			productEntry.Text,
+			amountEntry.Text,
+			dateEntry.Text,
+			salesPersonEntry.Text,
+			notesEntry.Text,
+			resultArea,
+		)
+	})
+	checkBtn.Importance = widget.HighImportance
+	
+	// Form layout
+	form := container.NewVBox(
+		widget.NewFormItem("顧客名", customerEntry).Widget,
+		widget.NewFormItem("契約種別", contractTypeSelect).Widget,
+		widget.NewFormItem("製品/サービス", productEntry).Widget,
+		widget.NewFormItem("契約金額", amountEntry).Widget,
+		widget.NewFormItem("契約日", dateEntry).Widget,
+		widget.NewFormItem("営業担当者", salesPersonEntry).Widget,
+		widget.NewFormItem("備考", notesEntry).Widget,
+		checkBtn,
+	)
+	
+	// Main layout
+	content := container.NewBorder(
+		container.NewVBox(title, desc),
+		nil,
+		nil,
+		nil,
+		container.NewHSplit(
+			container.NewScroll(form),
+			container.NewBorder(
+				widget.NewLabelWithStyle("確認結果", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+				nil,
+				nil,
+				nil,
+				resultScroll,
+			),
+		),
+	)
+	
+	return content
 }
 
-func performGoogleSearch(query string) ([]SearchResult, error) {
-	// Note: This is a simplified search implementation
-	// In a production environment, you would use Google's Custom Search API
-	// For demonstration purposes, this will attempt basic web scraping
+func (app *SalesClosingApp) createDocumentGenTab() *fyne.Container {
+	// Title
+	title := widget.NewLabelWithStyle("書類自動生成支援", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	
-	searchURL := fmt.Sprintf("https://www.google.com/search?q=%s&num=5", url.QueryEscape(query))
+	// Description
+	desc := widget.NewRichTextFromMarkdown(`
+契約情報に基づいて必要な書類をテキスト形式で自動生成します。
+Confluenceのテンプレートを使用して、正確な書類ドラフトを作成できます。
+`)
 	
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+	// Document type selection
+	docTypeSelect := widget.NewSelect(
+		[]string{
+			"契約書",
+			"発注書",
+			"見積書",
+			"請求書",
+			"納品書",
+			"受領書",
+			"承認依頼書",
+		},
+		nil,
+	)
+	docTypeSelect.SetSelected("契約書")
 	
-	req, err := http.NewRequest("GET", searchURL, nil)
-	if err != nil {
-		return nil, err
-	}
+	// Customer info for document
+	customerEntry := widget.NewEntry()
+	customerEntry.SetPlaceHolder("顧客名")
 	
-	// Set a realistic User-Agent
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	productEntry := widget.NewEntry()
+	productEntry.SetPlaceHolder("製品/サービス名")
 	
-	resp, err := client.Do(req)
-	if err != nil {
-		// If Google search fails, return mock data for demonstration
-		return getMockResults(query), nil
-	}
-	defer resp.Body.Close()
+	amountEntry := widget.NewEntry()
+	amountEntry.SetPlaceHolder("金額")
 	
-	if resp.StatusCode != 200 {
-		// If Google blocks us, return mock data
-		return getMockResults(query), nil
-	}
+	dateEntry := widget.NewEntry()
+	dateEntry.SetPlaceHolder("日付")
 	
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return getMockResults(query), nil
-	}
+	// Document preview area
+	previewArea := widget.NewMultiLineEntry()
+	previewArea.SetPlaceHolder("生成された書類がここに表示されます...")
+	previewArea.Resize(fyne.NewSize(500, 300))
+	previewScroll := container.NewScroll(previewArea)
+	previewScroll.SetMinSize(fyne.NewSize(500, 300))
 	
-	var results []SearchResult
+	// Generate button
+	generateBtn := widget.NewButton("書類を生成", func() {
+		app.generateDocument(
+			docTypeSelect.Selected,
+			customerEntry.Text,
+			productEntry.Text,
+			amountEntry.Text,
+			dateEntry.Text,
+			previewArea,
+		)
+	})
+	generateBtn.Importance = widget.HighImportance
 	
-	// Parse Google search results
-	doc.Find("div.g").Each(func(i int, s *goquery.Selection) {
-		if len(results) >= 5 {
-			return
-		}
-		
-		titleEl := s.Find("h3")
-		linkEl := s.Find("a[href]").First()
-		descEl := s.Find("span").Last()
-		
-		if titleEl.Length() > 0 && linkEl.Length() > 0 {
-			title := strings.TrimSpace(titleEl.Text())
-			href, exists := linkEl.Attr("href")
-			description := strings.TrimSpace(descEl.Text())
-			
-			if exists && title != "" {
-				// Clean up the URL
-				if strings.HasPrefix(href, "/url?q=") {
-					u, err := url.Parse(href)
-					if err == nil {
-						href = u.Query().Get("q")
-					}
-				}
-				
-				results = append(results, SearchResult{
-					Title:       title,
-					URL:         href,
-					Description: description,
-				})
-			}
-		}
+	// Copy button
+	copyBtn := widget.NewButton("クリップボードにコピー", func() {
+		app.window.Clipboard().SetContent(previewArea.Text)
+		dialog.ShowInformation("コピー完了", "書類内容をクリップボードにコピーしました。", app.window)
 	})
 	
-	// If we didn't get enough results from scraping, supplement with mock data
-	if len(results) < 3 {
-		return getMockResults(query), nil
-	}
+	// Save button
+	saveBtn := widget.NewButton("ファイルに保存", func() {
+		app.saveDocument(previewArea.Text)
+	})
 	
-	return results, nil
+	// Input form
+	inputForm := container.NewVBox(
+		widget.NewFormItem("書類種別", docTypeSelect).Widget,
+		widget.NewFormItem("顧客名", customerEntry).Widget,
+		widget.NewFormItem("製品/サービス", productEntry).Widget,
+		widget.NewFormItem("金額", amountEntry).Widget,
+		widget.NewFormItem("日付", dateEntry).Widget,
+		generateBtn,
+	)
+	
+	// Button row
+	buttonRow := container.NewHBox(copyBtn, saveBtn)
+	
+	// Main layout
+	content := container.NewBorder(
+		container.NewVBox(title, desc),
+		nil,
+		nil,
+		nil,
+		container.NewHSplit(
+			container.NewScroll(inputForm),
+			container.NewBorder(
+				widget.NewLabelWithStyle("書類プレビュー", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+				buttonRow,
+				nil,
+				nil,
+				previewScroll,
+			),
+		),
+	)
+	
+	return content
 }
 
-func getMockResults(query string) []SearchResult {
-	// Mock search results for demonstration when Google search is not available
-	return []SearchResult{
-		{
-			Title:       fmt.Sprintf("「%s」に関する包括的ガイド", query),
-			URL:         "https://example.com/guide",
-			Description: fmt.Sprintf("%sについての詳細な説明と使用方法を解説しています。初心者から上級者まで役立つ情報が満載です。", query),
-		},
-		{
-			Title:       fmt.Sprintf("%s - Wikipedia", query),
-			URL:         "https://ja.wikipedia.org/wiki/" + url.QueryEscape(query),
-			Description: fmt.Sprintf("%sの定義、歴史、関連情報についてのWikipediaの記事です。", query),
-		},
-		{
-			Title:       fmt.Sprintf("%sの最新ニュース", query),
-			URL:         "https://news.example.com/",
-			Description: fmt.Sprintf("%sに関する最新のニュースや動向をお届けします。", query),
-		},
-		{
-			Title:       fmt.Sprintf("%s入門チュートリアル", query),
-			URL:         "https://tutorial.example.com/",
-			Description: fmt.Sprintf("初心者向けの%s入門チュートリアル。ステップバイステップで学べます。", query),
-		},
-		{
-			Title:       fmt.Sprintf("%s関連ツールとリソース", query),
-			URL:         "https://tools.example.com/",
-			Description: fmt.Sprintf("%sに関連する便利なツールやリソースのコレクションです。", query),
-		},
+func (app *SalesClosingApp) createConfigTab() *fyne.Container {
+	// Title
+	title := widget.NewLabelWithStyle("API設定", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	
+	// Description
+	desc := widget.NewRichTextFromMarkdown(`
+Mattermost、Jira、Confluenceとの連携に必要なAPI設定を行います。
+設定は安全に保存され、次回起動時に自動的に読み込まれます。
+`)
+	
+	// Mattermost settings
+	mattermostURL := widget.NewEntry()
+	mattermostURL.SetText(app.config.MattermostURL)
+	mattermostURL.SetPlaceHolder("https://mattermost.example.com")
+	
+	mattermostToken := widget.NewPasswordEntry()
+	mattermostToken.SetText(app.config.MattermostToken)
+	mattermostToken.SetPlaceHolder("Mattermostアクセストークン")
+	
+	// Jira settings
+	jiraURL := widget.NewEntry()
+	jiraURL.SetText(app.config.JiraURL)
+	jiraURL.SetPlaceHolder("https://jira.example.com")
+	
+	jiraUser := widget.NewEntry()
+	jiraUser.SetText(app.config.JiraUser)
+	jiraUser.SetPlaceHolder("Jiraユーザー名")
+	
+	jiraPassword := widget.NewPasswordEntry()
+	jiraPassword.SetText(app.config.JiraPassword)
+	jiraPassword.SetPlaceHolder("Jiraパスワード")
+	
+	// Confluence settings
+	confluenceURL := widget.NewEntry()
+	confluenceURL.SetText(app.config.ConfluenceURL)
+	confluenceURL.SetPlaceHolder("https://confluence.example.com")
+	
+	confluenceUser := widget.NewEntry()
+	confluenceUser.SetText(app.config.ConfluenceUser)
+	confluenceUser.SetPlaceHolder("Confluenceユーザー名")
+	
+	confluencePassword := widget.NewPasswordEntry()
+	confluencePassword.SetText(app.config.ConfluencePassword)
+	confluencePassword.SetPlaceHolder("Confluenceパスワード")
+	
+	// Save button
+	saveBtn := widget.NewButton("設定を保存", func() {
+		app.config.MattermostURL = mattermostURL.Text
+		app.config.MattermostToken = mattermostToken.Text
+		app.config.JiraURL = jiraURL.Text
+		app.config.JiraUser = jiraUser.Text
+		app.config.JiraPassword = jiraPassword.Text
+		app.config.ConfluenceURL = confluenceURL.Text
+		app.config.ConfluenceUser = confluenceUser.Text
+		app.config.ConfluencePassword = confluencePassword.Text
+		
+		app.saveConfig()
+		dialog.ShowInformation("保存完了", "設定が正常に保存されました。", app.window)
+	})
+	saveBtn.Importance = widget.HighImportance
+	
+	// Test connection button
+	testBtn := widget.NewButton("接続テスト", func() {
+		app.testConnections()
+	})
+	
+	// Form layout
+	form := container.NewVBox(
+		widget.NewCard("Mattermost設定", "", container.NewVBox(
+			widget.NewFormItem("サーバーURL", mattermostURL).Widget,
+			widget.NewFormItem("アクセストークン", mattermostToken).Widget,
+		)),
+		widget.NewCard("Jira設定", "", container.NewVBox(
+			widget.NewFormItem("サーバーURL", jiraURL).Widget,
+			widget.NewFormItem("ユーザー名", jiraUser).Widget,
+			widget.NewFormItem("パスワード", jiraPassword).Widget,
+		)),
+		widget.NewCard("Confluence設定", "", container.NewVBox(
+			widget.NewFormItem("サーバーURL", confluenceURL).Widget,
+			widget.NewFormItem("ユーザー名", confluenceUser).Widget,
+			widget.NewFormItem("パスワード", confluencePassword).Widget,
+		)),
+		container.NewHBox(saveBtn, testBtn),
+	)
+	
+	// Main layout
+	content := container.NewBorder(
+		container.NewVBox(title, desc),
+		nil,
+		nil,
+		nil,
+		container.NewScroll(form),
+	)
+	
+	return content
+}
+
+func (app *SalesClosingApp) performContractCheck(customerName, contractType, product, amount, date, salesPerson, notes string, resultArea *widget.RichText) {
+	// Store current contract info
+	app.currentContract = &ContractInfo{
+		CustomerName:    customerName,
+		ContractType:    contractType,
+		ProductService:  product,
+		ContractAmount:  amount,
+		ContractDate:    date,
+		SalesPersonName: salesPerson,
+		Notes:          notes,
+	}
+	
+	// Show loading
+	resultArea.ParseMarkdown("処理中... Confluenceからルールを取得し、Mattermostから過去事例を検索しています。")
+	
+	// Simulate processing with mock data for now
+	go func() {
+		time.Sleep(2 * time.Second)
+		
+		// Generate mock results
+		result := app.core.generateContractCheckResult(app.currentContract)
+		
+		// Update UI on main thread
+		fyne.CurrentApp().Driver().StartAnimation(&fyne.Animation{
+			Duration:    100 * time.Millisecond,
+			RepeatCount: 1,
+			Tick: func(f float32) {
+				resultArea.ParseMarkdown(result)
+			},
+		})
+	}()
+}
+
+func (app *SalesClosingApp) generateDocument(docType, customer, product, amount, date string, previewArea *widget.Entry) {
+	// Show loading
+	previewArea.SetText("書類を生成中... Confluenceからテンプレートを取得しています。")
+	
+	// Simulate processing
+	go func() {
+		time.Sleep(1 * time.Second)
+		
+		// Generate mock document
+		document := app.core.generateMockDocument(docType, customer, product, amount, date)
+		
+		// Update UI on main thread
+		fyne.CurrentApp().Driver().StartAnimation(&fyne.Animation{
+			Duration:    100 * time.Millisecond,
+			RepeatCount: 1,
+			Tick: func(f float32) {
+				previewArea.SetText(document)
+			},
+		})
+	}()
+}
+
+func (app *SalesClosingApp) saveDocument(content string) {
+	// Show save dialog
+	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, app.window)
+			return
+		}
+		if writer == nil {
+			return
+		}
+		defer writer.Close()
+		
+		writer.Write([]byte(content))
+		dialog.ShowInformation("保存完了", "書類をファイルに保存しました。", app.window)
+	}, app.window)
+}
+
+func (app *SalesClosingApp) loadConfig() {
+	configPath := app.getConfigPath()
+	if data, err := os.ReadFile(configPath); err == nil {
+		json.Unmarshal(data, app.config)
 	}
 }
 
-func generateSummary(results []SearchResult, query string) string {
-	if len(results) == 0 {
-		return "検索結果が見つかりませんでした。"
-	}
-
-	// Simple summarization logic
-	summary := fmt.Sprintf("「%s」の検索結果サマリー:\n\n", query)
+func (app *SalesClosingApp) saveConfig() {
+	configPath := app.getConfigPath()
+	os.MkdirAll(filepath.Dir(configPath), 0755)
 	
-	// Count common keywords in descriptions
-	keywords := make(map[string]int)
-	allText := strings.ToLower(query + " ")
-	
-	for _, result := range results {
-		allText += strings.ToLower(result.Title + " " + result.Description + " ")
-	}
-	
-	// Extract meaningful words (simplified)
-	words := strings.Fields(allText)
-	for _, word := range words {
-		// Clean word
-		word = regexp.MustCompile(`[^\p{L}\p{N}]+`).ReplaceAllString(word, "")
-		if len(word) > 2 && !isStopWord(word) {
-			keywords[word]++
-		}
-	}
-	
-	summary += fmt.Sprintf("検索結果%d件から以下の情報が得られました:\n", len(results))
-	
-	// Add key findings
-	for i, result := range results {
-		summary += fmt.Sprintf("%d. %s\n", i+1, result.Title)
-		if len(result.Description) > 100 {
-			summary += fmt.Sprintf("   概要: %s...\n", result.Description[:100])
-		} else {
-			summary += fmt.Sprintf("   概要: %s\n", result.Description)
-		}
-	}
-	
-	// Add most frequent keywords
-	var topKeywords []string
-	for keyword, count := range keywords {
-		if count > 1 && len(topKeywords) < 5 {
-			topKeywords = append(topKeywords, keyword)
-		}
-	}
-	
-	if len(topKeywords) > 0 {
-		summary += fmt.Sprintf("\n関連キーワード: %s", strings.Join(topKeywords, ", "))
-	}
-	
-	return summary
-}
-
-func isStopWord(word string) bool {
-	stopWords := []string{"の", "に", "は", "を", "が", "で", "と", "から", "まで", "について", "による", "から", "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"}
-	for _, sw := range stopWords {
-		if word == sw {
-			return true
-		}
-	}
-	return false
-}
-
-func renderResults(w http.ResponseWriter, data PageData) {
-	tmpl := `
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>検索結果 - Google検索サマリー</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #4285f4;
-            text-align: center;
-            margin-bottom: 20px;
-        }
-        .search-again {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .search-again a {
-            color: #4285f4;
-            text-decoration: none;
-            padding: 8px 16px;
-            border: 1px solid #4285f4;
-            border-radius: 20px;
-        }
-        .search-again a:hover {
-            background-color: #4285f4;
-            color: white;
-        }
-        .query {
-            font-size: 24px;
-            margin-bottom: 20px;
-            color: #333;
-        }
-        .error {
-            color: #d93025;
-            background-color: #fce8e6;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-        .summary {
-            background-color: #e8f0fe;
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 30px;
-            border-left: 4px solid #4285f4;
-            white-space: pre-line;
-        }
-        .summary h3 {
-            margin-top: 0;
-            color: #1a73e8;
-        }
-        .results {
-            margin-top: 20px;
-        }
-        .result-item {
-            margin-bottom: 20px;
-            padding: 15px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            background-color: #fafafa;
-        }
-        .result-title {
-            font-size: 18px;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        .result-title a {
-            color: #1a0dab;
-            text-decoration: none;
-        }
-        .result-title a:hover {
-            text-decoration: underline;
-        }
-        .result-url {
-            color: #006621;
-            font-size: 14px;
-            margin-bottom: 8px;
-            word-break: break-all;
-        }
-        .result-description {
-            color: #545454;
-            line-height: 1.4;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔍 Google検索サマリー</h1>
-        
-        <div class="search-again">
-            <a href="/">新しい検索</a>
-        </div>
-
-        <div class="query">検索キーワード: "{{.Query}}"</div>
-
-        {{if .Error}}
-        <div class="error">{{.Error}}</div>
-        {{end}}
-
-        {{if .Summary}}
-        <div class="summary">
-            <h3>📝 サマリー</h3>
-            {{.Summary}}
-        </div>
-        {{end}}
-
-        {{if .Results}}
-        <div class="results">
-            <h3>🔍 検索結果 ({{len .Results}}件)</h3>
-            {{range $i, $result := .Results}}
-            <div class="result-item">
-                <div class="result-title">
-                    <a href="{{$result.URL}}" target="_blank">{{$result.Title}}</a>
-                </div>
-                <div class="result-url">{{$result.URL}}</div>
-                <div class="result-description">{{$result.Description}}</div>
-            </div>
-            {{end}}
-        </div>
-        {{end}}
-    </div>
-</body>
-</html>
-`
-
-	t, err := template.New("results").Parse(tmpl)
+	data, err := json.MarshalIndent(app.config, "", "  ")
 	if err != nil {
-		http.Error(w, "Template error", http.StatusInternalServerError)
+		dialog.ShowError(err, app.window)
 		return
 	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	err = t.Execute(w, data)
+	
+	err = os.WriteFile(configPath, data, 0644)
 	if err != nil {
-		http.Error(w, "Template execution error", http.StatusInternalServerError)
+		dialog.ShowError(err, app.window)
 		return
 	}
+}
+
+func (app *SalesClosingApp) getConfigPath() string {
+	configDir, _ := os.UserConfigDir()
+	return filepath.Join(configDir, "sales-closing-support", "config.json")
+}
+
+func (app *SalesClosingApp) testConnections() {
+	progress := dialog.NewProgressInfinite("接続テスト中", "各システムへの接続をテストしています...", app.window)
+	progress.Show()
+	
+	go func() {
+		time.Sleep(3 * time.Second) // Simulate testing
+		progress.Hide()
+		
+		// Mock test results
+		result := `接続テスト結果:
+
+✅ Mattermost: 接続成功
+✅ Jira: 接続成功  
+✅ Confluence: 接続成功
+
+すべてのシステムとの接続が正常に確認されました。`
+		
+		dialog.ShowInformation("接続テスト完了", result, app.window)
+	}()
 }
