@@ -5,6 +5,9 @@
 *.so
 *.dylib
 google-search-summary
+sales-closing-support
+sales-closing-support.exe
+sales-closing-support-mac
 
 # Test binary, built with `go test -c`
 *.test
@@ -17,3 +20,13 @@ google-search-summary
 
 # Go workspace file
 go.work
+
+# Configuration files
+config.json
+
+# Log files
+*.log
+
+# IDE files
+.vscode/
+.idea/
